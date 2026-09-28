@@ -114,48 +114,137 @@ def fetch_page_html(title: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# 3. PARSE: find the Contestants table among all tables on the page
+# 3. PARSE
 # ---------------------------------------------------------------------------
-def find_contestants_table(html: str, title: str) -> pd.DataFrame:
+# Wikipedia season pages are NOT uniform:
+#   Seasons 8-12 : Contestants table has a "Fight Record" column (e.g. 3-1)
+#                  and the table is SPLIT into several pieces on the page.
+#   Seasons 6-7  : Contestants table has NO "Fight Record" column (it has
+#                  Weapon / Elim. in instead), but the page has full fight-by-
+#                  fight result tables (Winner / Loser / Method / Time).
+# So we (a) collect ALL contestant table pieces, and (b) when there's no
+# Fight Record column, we compute every robot's record from the fight tables.
+
+def _flatten_columns(df):
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = [" ".join(str(x) for x in tup if "Unnamed" not in str(x)).strip()
+                      for tup in df.columns]
+    else:
+        df.columns = [str(c).strip() for c in df.columns]
+    return df
+
+
+def robot_key(name) -> str:
+    """Matching key so 'Death Roll' == 'DeathRoll', 'The Ringmaster' == 'Ringmaster'."""
+    s = re.sub(r"\[.*?\]", "", str(name)).lower().strip()
+    s = re.sub(r"^the\s+", "", s)
+    return re.sub(r"[^a-z0-9]", "", s)
+
+
+def clean_robot_name(name) -> str:
+    s = re.sub(r"\[.*?\]", "", str(name)).strip()
+    return re.sub(r"[\*\u2020\u2021]+$", "", s).strip()
+
+
+def read_all_tables(html: str, title: str):
     try:
-        # IMPORTANT: pass HTML through StringIO, not as a raw string. Newer
-        # pandas/lxml versions can otherwise mistake certain HTML strings for
-        # a file path and raise a confusing FileNotFoundError instead of
-        # actually parsing the markup.
+        # StringIO avoids pandas mistaking the HTML string for a file path
         tables = pd.read_html(StringIO(html))
     except ImportError as e:
-        raise ImportError(
-            "pandas.read_html needs 'lxml' installed to parse HTML tables. "
-            "Run: pip install -r requirements.txt  (then try again)"
-        ) from e
+        raise ImportError("pandas.read_html needs 'lxml'. Run: pip install -r requirements.txt") from e
     except ValueError as e:
         raise ValueError(f"pandas found no HTML tables at all on '{title}': {e}")
+    return [_flatten_columns(t) for t in tables]
 
-    ROBOT_HINTS = ("robot", "bot name", "name")
-    RECORD_HINTS = ("record", "fight", "w-l", "w/l")
 
-    candidates = []
+def find_contestant_tables(tables, title):
+    """Return ALL table pieces that list robots (they are often split in two)."""
+    pieces, diagnostics = [], []
     for i, df in enumerate(tables):
-        cols = [str(c).strip().lower() for c in df.columns]
-        has_robot = any(any(h in c for h in ROBOT_HINTS) for c in cols)
-        has_record = any(any(h in c for h in RECORD_HINTS) for c in cols)
-        candidates.append((i, cols, has_robot, has_record))
-        if has_robot and has_record:
-            return df
+        cols = [c.lower() for c in df.columns]
+        has_robot = any("robot" in c for c in cols)
+        has_result = any(("record" in c) or ("elim" in c) for c in cols)
+        diagnostics.append((i, cols))
+        if has_robot and has_result:
+            pieces.append(df)
+    if not pieces:
+        print(f"    No contestant table found on '{title}'. Tables on page:")
+        for i, cols in diagnostics:
+            print(f"      Table {i}: {cols}")
+        raise ValueError(f"No table with a Robot column and a Record/Elim. column on '{title}'.")
+    return pieces
 
-    # Nothing matched both hints -- print full diagnostics so this is fixable
-    # instead of a silent skip.
-    print(f"    Could not auto-detect the Contestants table on '{title}'. "
-          f"Found {len(tables)} table(s) on the page:")
-    for i, cols, has_robot, has_record in candidates:
-        print(f"      Table {i}: columns = {cols}  "
-              f"(robot-like column: {has_robot}, record-like column: {has_record})")
 
-    raise ValueError(
-        f"No table with both a Robot-like column and a Record-like column was found on '{title}'. "
-        f"See the printed column list above -- if one of those tables is clearly the right one "
-        f"but named differently, update ROBOT_HINTS/RECORD_HINTS in find_contestants_table()."
-    )
+def normalize_contestants(pieces, title) -> pd.DataFrame:
+    frames = []
+    for df in pieces:
+        rename = {}
+        for c in df.columns:
+            cl = c.lower()
+            if "robot" in cl:                 rename[c] = "Robot"
+            elif "weapon" in cl:              rename[c] = "Weapon"
+            elif "builder" in cl:             rename[c] = "Builder"
+            elif "hometown" in cl or "location" in cl: rename[c] = "Hometown"
+            elif "record" in cl:              rename[c] = "Fight Record"
+            elif "elim" in cl:                rename[c] = "Eliminated In"
+        df = df.rename(columns=rename)
+        df = df.loc[:, ~df.columns.duplicated()]
+        keep = [c for c in ["Robot", "Weapon", "Builder", "Hometown",
+                            "Fight Record", "Eliminated In"] if c in df.columns]
+        frames.append(df[keep])
+    out = pd.concat(frames, ignore_index=True)
+    # drop repeated header rows / junk rows that ended up inside the data
+    out = out[out["Robot"].notna()]
+    out = out[out["Robot"].astype(str).str.strip().str.lower() != "robot"]
+    out["Robot"] = out["Robot"].map(clean_robot_name)
+    out = out[out["Robot"] != ""].drop_duplicates(subset="Robot").reset_index(drop=True)
+    return out
+
+
+def find_fight_tables(tables) -> pd.DataFrame:
+    """
+    Fight-by-fight tables: columns like Episode | Battle | Winner | Loser | Method | Time.
+    Rumble tables (3+ robots) use 'Losers' and are skipped on purpose.
+    """
+    rows = []
+    for df in tables:
+        cols = {c.lower(): c for c in df.columns}
+        win_col = cols.get("winner") or cols.get("champion")
+        lose_col = cols.get("loser")
+        if not win_col or not lose_col:
+            continue
+        for _, r in df.iterrows():
+            w, l = r[win_col], r[lose_col]
+            if pd.isna(w) or pd.isna(l):
+                continue
+            method = str(r[cols["method"]]) if "method" in cols else ""
+            method = re.sub(r"\[.*?\]|\^|\{.*?\}", "", method).strip()
+            rows.append({
+                "Episode": r[cols["episode"]] if "episode" in cols else None,
+                "Winner": clean_robot_name(w),
+                "Loser": clean_robot_name(l),
+                "Method": method,
+                "Time": r[cols["time"]] if "time" in cols else None,
+            })
+    return pd.DataFrame(rows)
+
+
+def records_from_fights(contestants: pd.DataFrame, fights: pd.DataFrame) -> pd.DataFrame:
+    wins, losses = {}, {}
+    for _, f in fights.iterrows():
+        wins[robot_key(f["Winner"])] = wins.get(robot_key(f["Winner"]), 0) + 1
+        losses[robot_key(f["Loser"])] = losses.get(robot_key(f["Loser"]), 0) + 1
+    keys = contestants["Robot"].map(robot_key)
+    contestants = contestants.copy()
+    contestants["Wins"] = keys.map(lambda k: wins.get(k, 0))
+    contestants["Losses"] = keys.map(lambda k: losses.get(k, 0))
+    contestants["Ties"] = 0
+    known = set(keys)
+    unmatched = (set(wins) | set(losses)) - known
+    if unmatched:
+        print(f"    note: {len(unmatched)} name(s) in fight tables not in contestants table "
+              f"(spelling differences?): {sorted(unmatched)[:8]}")
+    return contestants
 
 
 def clean_record(record):
@@ -165,165 +254,122 @@ def clean_record(record):
     normalized = re.sub(r"[\u2012\u2013\u2014\u2212]", "-", str(record)).strip()
     parts = re.findall(r"\d+", normalized)
     if len(parts) == 2:
-        wins, losses = map(int, parts)
-        return wins, losses, 0
-    elif len(parts) == 3:
-        wins, losses, ties = map(int, parts)
-        return wins, losses, ties
+        return int(parts[0]), int(parts[1]), 0
+    if len(parts) == 3:
+        return int(parts[0]), int(parts[1]), int(parts[2])
     return None, None, None
-
-
-def normalize_columns(df: pd.DataFrame, title: str) -> pd.DataFrame:
-    """Map whatever the real column names are to a consistent schema."""
-    # Flatten MultiIndex columns (can happen with rowspan'd wiki table headers)
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = [" ".join(str(x) for x in tup if "Unnamed" not in str(x)).strip()
-                      for tup in df.columns]
-
-    rename_map = {}
-    for c in df.columns:
-        cl = str(c).strip().lower()
-        if "robot" in cl or cl == "name" or cl == "bot name":
-            rename_map[c] = "Robot"
-        elif "builder" in cl:
-            rename_map[c] = "Builder"
-        elif "hometown" in cl or "location" in cl:
-            rename_map[c] = "Hometown"
-        elif "record" in cl or "fight" in cl or cl in ("w-l", "w/l"):
-            rename_map[c] = "Fight Record"
-    df = df.rename(columns=rename_map)
-
-    if "Robot" not in df.columns:
-        raise ValueError(
-            f"After renaming, '{title}' still has no 'Robot' column. "
-            f"Original columns were: {list(df.columns)}"
-        )
-    if "Fight Record" not in df.columns:
-        raise ValueError(
-            f"After renaming, '{title}' still has no 'Fight Record' column. "
-            f"Original columns were: {list(df.columns)}"
-        )
-
-    keep = [c for c in ["Robot", "Builder", "Hometown", "Fight Record"] if c in df.columns]
-    return df[keep]
 
 
 # ---------------------------------------------------------------------------
 # 4. MAIN PIPELINE
 # ---------------------------------------------------------------------------
 def build_dataset():
-    all_rows = []
-    per_season_frames = {}
-    failures = []
+    all_rows, fight_logs, per_season_frames, failures = [], [], {}, []
 
     for title, label, year in SEASONS:
         print(f"Fetching {label} ...")
         try:
             html = fetch_page_html(title)
-            raw_df = find_contestants_table(html, title)
-            df = normalize_columns(raw_df, title)
+            tables = read_all_tables(html, title)
+            df = normalize_contestants(find_contestant_tables(tables, title), title)
+            fights = find_fight_tables(tables)
+
+            if "Fight Record" in df.columns:
+                recs = [clean_record(x) for x in df["Fight Record"]]
+                df["Wins"] = [r[0] for r in recs]
+                df["Losses"] = [r[1] for r in recs]
+                df["Ties"] = [r[2] for r in recs]
+                df["Record Source"] = "Contestants table (Fight Record)"
+            elif not fights.empty:
+                df = records_from_fights(df, fights)
+                df["Record Source"] = "Computed from fight-by-fight tables"
+            else:
+                raise ValueError("No Fight Record column AND no fight-by-fight tables to compute one from.")
         except Exception as e:
             print(f"  FAILED: {label} -> {e}\n")
             failures.append((label, str(e)))
             continue
 
-        df["Robot"] = df["Robot"].astype(str).str.replace(r"\[.*?\]", "", regex=True).str.strip()
-        df["Robot"] = df["Robot"].str.replace(r"\*+$", "", regex=True).str.strip()
-
-        wins, losses, ties = [], [], []
-        for rec in df.get("Fight Record", pd.Series([None] * len(df))):
-            w, l, t = clean_record(rec)
-            wins.append(w)
-            losses.append(l)
-            ties.append(t)
-
-        df["Wins"] = wins
-        df["Losses"] = losses
-        df["Ties"] = ties
         df["Total Fights"] = df[["Wins", "Losses", "Ties"]].sum(axis=1, min_count=1)
-        df["Win %"] = (df["Wins"] / df["Total Fights"]).round(3)
-        df["Season"] = label
-        df["Year"] = year
+        df["Win %"] = (df["Wins"] / df["Total Fights"].where(df["Total Fights"] > 0)).round(3)
+        df["Season"], df["Year"] = label, year
+
+        if not fights.empty:
+            fl = fights.copy()
+            fl.insert(0, "Year", year)
+            fl.insert(0, "Season", label)
+            fight_logs.append(fl)
 
         per_season_frames[label] = df.copy()
         all_rows.append(df)
-        print(f"  OK: {label} -> {len(df)} robots parsed")
-        time.sleep(0.5)  # be polite to Wikipedia's servers
+        print(f"  OK: {label} -> {len(df)} robots ({df['Record Source'].iloc[0]})"
+              + (f", {len(fights)} individual fights logged" if not fights.empty else ""))
+        time.sleep(0.5)
 
     print("\n" + "=" * 70)
     print(f"SUMMARY: {len(all_rows)}/{len(SEASONS)} seasons parsed successfully.")
-    if failures:
-        print("Seasons that FAILED:")
-        for label, err in failures:
-            print(f"  - {label}: {err}")
+    for label, err in failures:
+        print(f"  FAILED - {label}: {err}")
     print("=" * 70 + "\n")
 
     if not all_rows:
-        print(
-            "No data was collected at all, so no Excel file was written.\n"
-            "Read the 'FAILED' messages above -- they tell you exactly what went wrong "
-            "for each season (network error vs. table-not-found vs. missing column).\n"
-            "Most common causes:\n"
-            "  1. No internet access from this machine/environment right now.\n"
-            "  2. A firewall/proxy blocking en.wikipedia.org.\n"
-            "  3. Wikipedia changed a page's table structure (the printed column "
-            "list above each failure shows you exactly what's on the page now).\n"
-        )
+        print("No data was collected, so no Excel file was written. Read the FAILED lines above.")
         sys.exit(1)
 
     all_fights = pd.concat(all_rows, ignore_index=True)
-    ordered_cols = ["Season", "Year", "Robot", "Builder", "Hometown",
-                     "Wins", "Losses", "Ties", "Total Fights", "Win %"]
-    all_fights = all_fights[[c for c in ordered_cols if c in all_fights.columns]]
+    ordered = ["Season", "Year", "Robot", "Weapon", "Builder", "Hometown", "Eliminated In",
+               "Wins", "Losses", "Ties", "Total Fights", "Win %", "Record Source"]
+    all_fights = all_fights[[c for c in ordered if c in all_fights.columns]]
+    all_fights["Robot_Key"] = all_fights["Robot"].map(robot_key)
+
+    def first_non_null(s):
+        s = s.dropna()
+        return s.iloc[0] if len(s) else None
 
     career = (
-        all_fights.groupby("Robot", as_index=False)
+        all_fights.groupby("Robot_Key", as_index=False)
         .agg(
+            Robot=("Robot", "last"),      # most recent spelling
             Seasons_Played=("Season", lambda s: ", ".join(sorted(set(s)))),
             Number_of_Seasons=("Season", "nunique"),
             Career_Wins=("Wins", "sum"),
             Career_Losses=("Losses", "sum"),
             Career_Ties=("Ties", "sum"),
+            Weapon_S6_S7=("Weapon", first_non_null) if "Weapon" in all_fights.columns else ("Season", "first"),
         )
     )
+    if "Weapon" not in all_fights.columns:
+        career = career.drop(columns=["Weapon_S6_S7"])
     career["Career_Fights"] = career[["Career_Wins", "Career_Losses", "Career_Ties"]].sum(axis=1)
-    career["Career_Win %"] = (career["Career_Wins"] / career["Career_Fights"]).round(3)
+    career["Career_Win %"] = (career["Career_Wins"] / career["Career_Fights"].where(career["Career_Fights"] > 0)).round(3)
+    front = ["Robot", "Seasons_Played", "Number_of_Seasons", "Career_Wins", "Career_Losses",
+             "Career_Ties", "Career_Fights", "Career_Win %"]
+    career = career[front + [c for c in career.columns if c not in front + ["Robot_Key"]]]
     career = career.sort_values("Career_Wins", ascending=False).reset_index(drop=True)
+    all_fights = all_fights.drop(columns=["Robot_Key"])
 
-    return all_fights, career, per_season_frames
+    fight_log = pd.concat(fight_logs, ignore_index=True) if fight_logs else pd.DataFrame()
+    return all_fights, career, per_season_frames, fight_log
 
 
 # ---------------------------------------------------------------------------
 # 5. EXPORT TO EXCEL
 # ---------------------------------------------------------------------------
-def export_to_excel(all_fights, career, per_season_frames, path=OUTPUT_FILE):
+def export_to_excel(all_fights, career, per_season_frames, fight_log=None, path=OUTPUT_FILE):
     with pd.ExcelWriter(path, engine="openpyxl") as writer:
         all_fights.to_excel(writer, sheet_name="All_Fights_Raw", index=False)
         career.to_excel(writer, sheet_name="Career_Totals", index=False)
+        if fight_log is not None and not fight_log.empty:
+            fight_log.to_excel(writer, sheet_name="Fight_Log", index=False)
         for label, df in per_season_frames.items():
             sheet_name = label[:31]
             df.to_excel(writer, sheet_name=sheet_name, index=False)
 
-    _autofit_and_style(path)
+    import excel_style
+    excel_style.style_workbook(path)
     print(f"Done. Workbook saved to: {path}")
 
 
-def _autofit_and_style(path):
-    from openpyxl import load_workbook
-    from openpyxl.styles import Font
-
-    wb = load_workbook(path)
-    for ws in wb.worksheets:
-        ws.freeze_panes = "A2"
-        for cell in ws[1]:
-            cell.font = Font(bold=True)
-        for col_cells in ws.columns:
-            length = max((len(str(c.value)) if c.value is not None else 0) for c in col_cells)
-            col_letter = col_cells[0].column_letter
-            ws.column_dimensions[col_letter].width = min(max(length + 2, 10), 45)
-    wb.save(path)
-
-
 if __name__ == "__main__":
-    fights_df, career_df, season_dfs = build_dataset()
-    export_to_excel(fights_df, career_df, season_dfs)
+    fights_df, career_df, season_dfs, fight_log_df = build_dataset()
+    export_to_excel(fights_df, career_df, season_dfs, fight_log_df)
