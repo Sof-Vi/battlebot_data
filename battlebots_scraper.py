@@ -14,7 +14,7 @@ Usage:
     python battlebots_scraper.py
 
 Output:
-    battlebots_2015_2025.xlsx  (in the same folder)
+    battlebots_2018_2022.xlsx  (in the same folder)
 
 IF THIS SCRIPT PRODUCES NO DATA / EXITS WITH AN ERROR:
     This version prints a diagnostic report for every season it could not
