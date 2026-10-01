@@ -32,7 +32,9 @@ Output:
 """
 
 import json
+import os
 import re
+import sys
 import time
 from pathlib import Path
 
@@ -75,11 +77,52 @@ WORD_TO_NUM = {
     "six": 6, "seven": 7, "eight": 8,
 }
 
+# Keyword -> canonical wheel-POSITION tag. Checked against the same Drive_Type
+# text that Wheel_Count is extracted from. A robot's text can match more than
+# one (e.g. "four internal wheels, corner-mounted" -> Internal + Corner-mounted),
+# so this returns a list, not a single value.
+WHEEL_POSITION_KEYWORDS = [
+    (r"\binternal\b", "Internal"),
+    (r"\bexternal\b", "External"),
+    (r"\boutrigger", "Outrigger"),
+    (r"\bcorner", "Corner-mounted"),
+    (r"\bfront[\s-]?wheel", "Front-mounted"),
+    (r"\brear[\s-]?wheel", "Rear-mounted"),
+    (r"\bomni", "Omnidirectional"),
+    (r"\bmecanum", "Omnidirectional"),
+    (r"\bwalk(er|ing)\b|\bleg(ged|s)?\b", "Walker/Legged"),
+    (r"\btrack(ed|s)?\b", "Tracked"),
+    (r"\bhub[\s-]?motor", "Hub-motor"),
+]
+
+
 
 def get_robot_list(workbook=WORKBOOK):
     """Pull unique robot names to look up from the Career_Totals sheet."""
-    df = pd.read_excel(workbook, sheet_name="Career_Totals")
-    return sorted(df["Robot"].dropna().unique().tolist())
+    if not os.path.exists(workbook):
+        sys.exit(
+            f"\nERROR: '{workbook}' does not exist yet.\n"
+            f"This script needs the robot list that battlebots_scraper.py produces.\n"
+            f"Run this first:\n\n    python battlebots_scraper.py\n\n"
+            f"...and confirm it prints 'Done. Workbook saved to: {workbook}' before "
+            f"running bot_features_scraper.py.\n"
+        )
+    try:
+        df = pd.read_excel(workbook, sheet_name="Career_Totals")
+    except ValueError as e:
+        sys.exit(
+            f"\nERROR: '{workbook}' exists but has no 'Career_Totals' sheet ({e}).\n"
+            f"This usually means battlebots_scraper.py exited early/failed. Re-run it "
+            f"and check its console output for 'FAILED' lines before continuing.\n"
+        )
+    names = sorted(df["Robot"].dropna().unique().tolist())
+    if not names:
+        sys.exit(
+            f"\nERROR: 'Career_Totals' sheet in '{workbook}' has zero robots in it.\n"
+            f"battlebots_scraper.py ran but collected no usable rows -- re-run it and "
+            f"check its console output for details.\n"
+        )
+    return names
 
 
 def load_cache():
@@ -155,6 +198,16 @@ def normalize_fields(raw: dict) -> dict:
         if wheel_count is None and token.isdigit():
             wheel_count = int(token)
     out["Wheel_Count"] = wheel_count
+
+    # Same idea for wheel POSITION/configuration -- e.g. "two internal wheels"
+    # gives Wheel_Count=2, Wheel_Position="Internal". No match just means the
+    # wiki's text didn't say (very common) -- left blank rather than guessed.
+    positions_found = []
+    for pattern, tag in WHEEL_POSITION_KEYWORDS:
+        if re.search(pattern, drive_text.lower()):
+            positions_found.append(tag)
+    out["Wheel_Position"] = " / ".join(positions_found) if positions_found else None
+
     return out
 
 
@@ -211,6 +264,9 @@ def append_to_workbook(features_df, workbook=WORKBOOK, sheet_name="Bot_Features"
 
     with pd.ExcelWriter(workbook, engine="openpyxl", mode="a") as writer:
         features_df.to_excel(writer, sheet_name=sheet_name, index=False)
+
+    import excel_style
+    excel_style.style_workbook(workbook)
     print(f"\n'{sheet_name}' sheet written to {workbook} ({len(features_df)} robots).")
 
 

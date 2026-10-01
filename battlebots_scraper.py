@@ -14,7 +14,7 @@ Usage:
     python battlebots_scraper.py
 
 Output:
-    battlebots_2018_2022.xlsx  (in the same folder)
+    battlebots_2015_2025.xlsx  (in the same folder)
 
 IF THIS SCRIPT PRODUCES NO DATA / EXITS WITH AN ERROR:
     This version prints a diagnostic report for every season it could not
@@ -30,6 +30,7 @@ IF THIS SCRIPT PRODUCES NO DATA / EXITS WITH AN ERROR:
 import re
 import time
 import sys
+import unicodedata
 from io import StringIO
 
 import requests
@@ -135,9 +136,12 @@ def _flatten_columns(df):
 
 
 def robot_key(name) -> str:
-    """Matching key so 'Death Roll' == 'DeathRoll', 'The Ringmaster' == 'Ringmaster'."""
+    """Matching key so 'Death Roll' == 'DeathRoll', 'The Ringmaster' == 'Ringmaster',
+    and 'Jäger' == 'Jager' (accented letters normalized to ASCII, since different
+    sources spell the same robot's name with or without diacritics)."""
     s = re.sub(r"\[.*?\]", "", str(name)).lower().strip()
     s = re.sub(r"^the\s+", "", s)
+    s = unicodedata.normalize("NFKD", s).encode("ascii", "ignore").decode("ascii")
     return re.sub(r"[^a-z0-9]", "", s)
 
 
